@@ -1,0 +1,11 @@
+# Needed to run dependencies.
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: orders
+    ports:
+      - "5432:5432"
