@@ -9,6 +9,7 @@ import (
 	"math"
 	"mime"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -32,6 +33,7 @@ const (
 const (
 	codeUnsupportedMediaType = "unsupported_media_type"
 	codeRequestTooLarge      = "request_too_large"
+	codeRequestTimeout       = "request_timeout"
 	codeInvalidJSON          = "invalid_json"
 	codeUnknownField         = "unknown_field"
 	codeMissingField         = "missing_field"
@@ -84,6 +86,13 @@ func readBatch(w http.ResponseWriter, r *http.Request) (payments.Batch, *request
 				status:  http.StatusRequestEntityTooLarge,
 				code:    codeRequestTooLarge,
 				message: fmt.Sprintf("request body must not exceed %d bytes", maxBodyBytes),
+			}
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return payments.Batch{}, &requestError{
+				status:  http.StatusRequestTimeout,
+				code:    codeRequestTimeout,
+				message: "the request body did not arrive in time; nothing was paid",
 			}
 		}
 		return payments.Batch{}, badRequest(codeInvalidJSON, "", "could not read request body")

@@ -83,7 +83,19 @@ func (s *Store) CreatePayments(ctx context.Context, batch payments.Batch) error 
 	err = retryAborted(ctx, s.onRetry, func() error {
 		return s.createPaymentsOnce(ctx, batch, total)
 	})
-	if isTimeout(err) {
+	return classifyBusy(err)
+}
+
+// classifyBusy wraps the errors that mean "temporarily unavailable, nothing
+// changed" in payments.ErrBusy: a PostgreSQL timeout, or an abort (deadlock,
+// serialization failure) that still happened on the last attempt.
+// A cancelled or expired request keeps its context error, and an unknown
+// commit outcome is never relabelled.
+func classifyBusy(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if isTimeout(err) || isRetryable(err) {
 		return fmt.Errorf("%w: %w", payments.ErrBusy, err)
 	}
 	return err

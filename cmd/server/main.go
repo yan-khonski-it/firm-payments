@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log"
 	"net"
@@ -12,7 +13,13 @@ import (
 	"time"
 
 	"firm-payments/internal/api"
+	"firm-payments/internal/postgres"
 )
+
+// maxOpenConns caps this instance's database connections. Every running
+// instance takes up to this many, so instances x maxOpenConns must stay below
+// PostgreSQL's max_connections (100 by default).
+const maxOpenConns = 20
 
 func main() {
 	addr := os.Getenv("ADDR")
@@ -20,8 +27,13 @@ func main() {
 		addr = ":8080"
 	}
 
-	// No payment service yet: the stub handler does not call it.
-	router := api.NewRouter(nil)
+	db, err := openDB(os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatalf("database: %v", err)
+	}
+	defer db.Close() // runs after the graceful shutdown below
+
+	router := api.NewRouter(postgres.NewStore(db))
 
 	srv := &http.Server{
 		Handler:           router,
@@ -56,4 +68,27 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown error: %v", err)
 	}
+}
+
+// openDB opens the connection pool and checks that PostgreSQL is reachable,
+// so a wrong DATABASE_URL fails at startup rather than on the first request.
+func openDB(dsn string) (*sql.DB, error) {
+	if dsn == "" {
+		return nil, errors.New("DATABASE_URL is not set")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxOpenConns)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
 }

@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -136,4 +137,36 @@ func TestCreatePaymentsStatementTimeoutRollsBack(t *testing.T) {
 		t.Fatalf("rollback: %v", err)
 	}
 	assertUnchanged(ctx, t, db, seedBalances)
+}
+
+func TestClassifyBusy(t *testing.T) {
+	deadlock := &pq.Error{Code: "40P01"}
+	tests := []struct {
+		name     string
+		err      error
+		wantBusy bool
+		wantAlso error // must still match, if set
+	}{
+		{"success", nil, false, nil},
+		{"lock timeout", &pq.Error{Code: "55P03"}, true, nil},
+		{"statement timeout", &pq.Error{Code: "57014"}, true, nil},
+		{"deadlock after the last retry", fmt.Errorf("lock firms: %w", deadlock), true, nil},
+		{"serialization failure after the last retry", &pq.Error{Code: "40001"}, true, nil},
+		{"request deadline during the retry backoff",
+			fmt.Errorf("%w (retry interrupted after: %w)", context.DeadlineExceeded, deadlock), false, context.DeadlineExceeded},
+		{"unknown commit outcome", fmt.Errorf("%w: commit: %w", payments.ErrOutcomeUnknown, deadlock), false, payments.ErrOutcomeUnknown},
+		{"business error", payments.ErrInsufficientFunds, false, payments.ErrInsufficientFunds},
+	}
+	for _, tt := range tests {
+		got := classifyBusy(tt.err)
+		if errors.Is(got, payments.ErrBusy) != tt.wantBusy {
+			t.Errorf("%s: classifyBusy(%v) = %v, want busy = %v", tt.name, tt.err, got, tt.wantBusy)
+		}
+		if tt.wantAlso != nil && !errors.Is(got, tt.wantAlso) {
+			t.Errorf("%s: classifyBusy(%v) = %v, want it to still match %v", tt.name, tt.err, got, tt.wantAlso)
+		}
+		if tt.err == nil && got != nil {
+			t.Errorf("%s: classifyBusy(nil) = %v, want nil", tt.name, got)
+		}
+	}
 }

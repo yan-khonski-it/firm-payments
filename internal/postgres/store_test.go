@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"math"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -17,6 +15,7 @@ import (
 	"github.com/lib/pq"
 
 	"firm-payments/internal/payments"
+	"firm-payments/internal/testdb"
 )
 
 // Firms from sql/000003_seed_firms.up.sql.
@@ -37,41 +36,11 @@ var seedBalances = map[string]int64{pinecrestUUID: 5000000, lopezUUID: 50000, na
 // fails the test promptly instead of hanging until go test's own timeout.
 const testTimeout = 10 * time.Second
 
-func testContext(t *testing.T) context.Context {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
-	t.Cleanup(cancel)
-	return ctx
-}
-
-// openTestDB connects to TEST_DATABASE_URL, which must point to a migrated
-// database that the tests may wipe, and resets it to the seed data. It returns
-// the test's context, which bounds setup, the test itself and its checks.
+// openTestDB resets the shared test database to the seed data and returns it
+// with the test's context; see testdb.Open.
 func openTestDB(t *testing.T) (*sql.DB, context.Context) {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL is not set; skipping PostgreSQL integration tests")
-	}
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		t.Fatalf("open database: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	db.SetMaxOpenConns(20)
-
-	seed, err := os.ReadFile(filepath.Join("..", "..", "sql", "000003_seed_firms.up.sql"))
-	if err != nil {
-		t.Fatalf("read seed: %v", err)
-	}
-	ctx := testContext(t)
-	if _, err := db.ExecContext(ctx, `TRUNCATE payments, firms RESTART IDENTITY`); err != nil {
-		t.Fatalf("reset tables: %v", err)
-	}
-	if _, err := db.ExecContext(ctx, string(seed)); err != nil {
-		t.Fatalf("apply seed: %v", err)
-	}
-	return db, ctx
+	return testdb.Open(t, testTimeout)
 }
 
 func balances(ctx context.Context, t *testing.T, db *sql.DB) map[string]int64 {

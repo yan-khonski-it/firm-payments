@@ -162,3 +162,18 @@ curl -i -X POST http://localhost:8080/payments \
   -H "Content-Type: application/json; charset=utf-8" \
   --data-binary "@payment-body.json"
 ```
+
+
+## AI assistance
+
+I used Claude Opus 5.5, OpenAI models (mostly Sol 6.1), and GitHub Copilot to assist with requirements, 
+implementation, tests, and code review.
+
+I coordinated several model conversations in parallel. While one model implemented a task,
+I reviewed another part of the solution with a second model and used GitHub Copilot to check earlier changes.
+I shared relevant context and feedback between these conversations and remained responsible for the decisions and final implementation.
+
+I reviewed the implementation, although my manual review of the test code was limited.
+
+The prompts and recorded responses are available in the [AI-prompts directory](./AI-prompts).
+These records include summaries and should not be treated as complete raw interaction logs.

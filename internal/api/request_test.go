@@ -268,7 +268,6 @@ func TestCreatePaymentsRequestHandling(t *testing.T) {
 		{"body too large", jsonRequest("application/json", tooLarge), http.StatusRequestEntityTooLarge, codeRequestTooLarge, ""},
 		{"invalid body", jsonRequest("application/json", `{`), http.StatusBadRequest, codeInvalidJSON, ""},
 		{"invalid field", jsonRequest("application/json", request(q(payerUUID))), http.StatusBadRequest, codeNoPayments, "payments"},
-		{"valid, with charset", jsonRequest("application/json; charset=utf-8", valid), http.StatusNotImplemented, codeNotImplemented, ""},
 	}
 
 	for _, tt := range tests {
