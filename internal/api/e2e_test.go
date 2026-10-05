@@ -54,7 +54,7 @@ func TestEndToEndSampleRequest(t *testing.T) {
 	db, ctx := resetTestDB(t)
 	srv := newInstance(t)
 
-	status, body := post(t, srv.URL, sampleBody)
+	status, body := post(ctx, t, srv.URL, sampleBody)
 
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body = %s", status, body)
@@ -82,7 +82,7 @@ func TestEndToEndInsufficientFunds(t *testing.T) {
 	srv := newInstance(t)
 
 	for i, want := range []int{201, 201, 201, 422} {
-		if status, body := post(t, srv.URL, sampleBody); status != want {
+		if status, body := post(ctx, t, srv.URL, sampleBody); status != want {
 			t.Fatalf("request %d: status = %d, want %d; body = %s", i+1, status, want, body)
 		}
 	}
@@ -99,7 +99,7 @@ func TestEndToEndUnknownPayee(t *testing.T) {
 	srv := newInstance(t)
 	body := strings.Replace(sampleBody, lopez, "00000000-0000-4000-8000-000000000000", 1)
 
-	status, resp := post(t, srv.URL, body)
+	status, resp := post(ctx, t, srv.URL, body)
 
 	if status != http.StatusNotFound || !strings.Contains(resp, `"field":"payments[2].payee_firm_uuid"`) {
 		t.Errorf("status = %d, body = %s; want 404 naming payments[2].payee_firm_uuid", status, resp)
@@ -125,7 +125,7 @@ func TestEndToEndTwoInstancesConcurrently(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			statuses[i], _ = post(t, instances[i%len(instances)].URL, sampleBody)
+			statuses[i], _ = post(ctx, t, instances[i%len(instances)].URL, sampleBody)
 		}(i)
 	}
 	close(start)
@@ -175,15 +175,28 @@ func openDB(t *testing.T, dsn string) *sql.DB {
 	return db
 }
 
-func post(t *testing.T, baseURL, body string) (int, string) {
+// httpClient bounds every request, so a server that stops answering fails the
+// test instead of hanging it. 15s is above the server's 8s budget plus its 2s
+// write margin.
+var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+func post(ctx context.Context, t *testing.T, baseURL, body string) (int, string) {
 	t.Helper()
-	resp, err := http.Post(baseURL+"/payments", "application/json", strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/payments", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		t.Errorf("POST /payments: %v", err)
 		return 0, ""
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Errorf("read response body: %v", err)
+	}
 	return resp.StatusCode, string(b)
 }
 

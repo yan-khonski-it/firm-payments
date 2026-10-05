@@ -27,9 +27,10 @@ func (s deadlineService) CreatePayments(ctx context.Context, _ payments.Batch) e
 	return nil
 }
 
-// sendSlowly writes the request headers, then the body in two halves with a
-// pause between them, and returns the response.
-func sendSlowly(t *testing.T, addr string, pause time.Duration) *http.Response {
+// startSlowRequest sends the request headers and only the first half of the
+// body. It returns the connection and the rest of the body, which the caller
+// sends later or not at all.
+func startSlowRequest(t *testing.T, addr string) (net.Conn, string) {
 	t.Helper()
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -38,11 +39,15 @@ func sendSlowly(t *testing.T, addr string, pause time.Duration) *http.Response {
 	t.Cleanup(func() { conn.Close() })
 
 	body := sampleRequest
-	fmt.Fprintf(conn, "POST /payments HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", len(body))
-	io.WriteString(conn, body[:len(body)/2])
-	time.Sleep(pause)
-	io.WriteString(conn, body[len(body)/2:]) // may fail if the server already gave up
+	head := fmt.Sprintf("POST /payments HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", len(body))
+	if _, err := io.WriteString(conn, head+body[:len(body)/2]); err != nil {
+		t.Fatalf("send headers and the first half of the body: %v", err)
+	}
+	return conn, body[len(body)/2:]
+}
 
+func readResponse(t *testing.T, conn net.Conn) *http.Response {
+	t.Helper()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
@@ -59,7 +64,11 @@ func TestCreatePaymentsSlowBodyTimesOut(t *testing.T) {
 	srv := httptest.NewServer(newRouter(svc, 300*time.Millisecond))
 	defer srv.Close()
 
-	resp := sendSlowly(t, srv.Listener.Addr().String(), time.Second)
+	// Send half the body and stop. The response is read while the upload is
+	// stalled: writing after the server gave up would make it reset the
+	// connection, and on Windows a reset discards the unread 408.
+	conn, _ := startSlowRequest(t, srv.Listener.Addr().String())
+	resp := readResponse(t, conn)
 
 	if resp.StatusCode != http.StatusRequestTimeout {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusRequestTimeout)
@@ -84,7 +93,12 @@ func TestCreatePaymentsBudgetIncludesReadingTheBody(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	resp := sendSlowly(t, srv.Listener.Addr().String(), pause)
+	conn, rest := startSlowRequest(t, srv.Listener.Addr().String())
+	time.Sleep(pause)
+	if _, err := io.WriteString(conn, rest); err != nil {
+		t.Fatalf("send the rest of the body: %v", err)
+	}
+	resp := readResponse(t, conn)
 
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)

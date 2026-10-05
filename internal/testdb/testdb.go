@@ -18,6 +18,10 @@ import (
 // database. Any constant works, as long as every test uses the same one.
 const lockKey = 20261005
 
+// lockWait bounds how long a test waits for another test to release the
+// database. It is separate from the test's own timeout.
+const lockWait = 60 * time.Second
+
 // Open connects to TEST_DATABASE_URL, which must point to a migrated database
 // that tests may wipe, and resets it to the seed data. It skips the test when
 // TEST_DATABASE_URL is unset.
@@ -26,18 +30,20 @@ const lockKey = 20261005
 // first takes a PostgreSQL advisory lock and holds it until the test ends:
 // tests that use the database run one at a time.
 //
-// The returned context ends after timeout; it bounds setup, the test and its
-// checks.
+// The returned context ends timeout after the lock is acquired, so waiting for
+// another test does not use up this test's time; it bounds setup, the test and
+// its checks.
 func Open(t *testing.T, timeout time.Duration) (*sql.DB, context.Context) {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set; skipping PostgreSQL integration tests")
 	}
+
+	lock(t, dsn)
+
 	ctx, cancel := context.WithTimeout(t.Context(), timeout)
 	t.Cleanup(cancel)
-
-	lock(ctx, t, dsn)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -50,10 +56,13 @@ func Open(t *testing.T, timeout time.Duration) (*sql.DB, context.Context) {
 	return db, ctx
 }
 
-// lock takes the advisory lock on a session of its own. Closing that session
-// when the test ends releases the lock.
-func lock(ctx context.Context, t *testing.T, dsn string) {
+// lock takes the advisory lock on a session of its own, waiting at most
+// lockWait. Closing that session when the test ends releases the lock.
+func lock(t *testing.T, dsn string) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), lockWait)
+	defer cancel()
+
 	lockDB, err := sql.Open("postgres", dsn)
 	if err != nil {
 		t.Fatalf("open lock connection: %v", err)
@@ -68,7 +77,7 @@ func lock(ctx context.Context, t *testing.T, dsn string) {
 		lockDB.Close()
 	})
 	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
-		t.Fatalf("wait for the test database: %v", err)
+		t.Fatalf("waited up to %v for another test to release the test database: %v", lockWait, err)
 	}
 }
 
