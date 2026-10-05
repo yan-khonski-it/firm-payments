@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,8 +45,9 @@ func testContext(t *testing.T) context.Context {
 }
 
 // openTestDB connects to TEST_DATABASE_URL, which must point to a migrated
-// database that the tests may wipe, and resets it to the seed data.
-func openTestDB(t *testing.T) *sql.DB {
+// database that the tests may wipe, and resets it to the seed data. It returns
+// the test's context, which bounds setup, the test itself and its checks.
+func openTestDB(t *testing.T) (*sql.DB, context.Context) {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -62,18 +64,19 @@ func openTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("read seed: %v", err)
 	}
-	if _, err := db.Exec(`TRUNCATE payments, firms RESTART IDENTITY`); err != nil {
+	ctx := testContext(t)
+	if _, err := db.ExecContext(ctx, `TRUNCATE payments, firms RESTART IDENTITY`); err != nil {
 		t.Fatalf("reset tables: %v", err)
 	}
-	if _, err := db.Exec(string(seed)); err != nil {
+	if _, err := db.ExecContext(ctx, string(seed)); err != nil {
 		t.Fatalf("apply seed: %v", err)
 	}
-	return db
+	return db, ctx
 }
 
-func balances(t *testing.T, db *sql.DB) map[string]int64 {
+func balances(ctx context.Context, t *testing.T, db *sql.DB) map[string]int64 {
 	t.Helper()
-	rows, err := db.Query(`SELECT uuid, balance_cents FROM firms`)
+	rows, err := db.QueryContext(ctx, `SELECT uuid, balance_cents FROM firms`)
 	if err != nil {
 		t.Fatalf("query balances: %v", err)
 	}
@@ -99,9 +102,9 @@ type paymentRow struct {
 	Description      string
 }
 
-func paymentRows(t *testing.T, db *sql.DB) []paymentRow {
+func paymentRows(ctx context.Context, t *testing.T, db *sql.DB) []paymentRow {
 	t.Helper()
-	rows, err := db.Query(`SELECT payer_firm_id, payee_firm_id, amount_cents, description FROM payments ORDER BY id`)
+	rows, err := db.QueryContext(ctx, `SELECT payer_firm_id, payee_firm_id, amount_cents, description FROM payments ORDER BY id`)
 	if err != nil {
 		t.Fatalf("query payments: %v", err)
 	}
@@ -121,12 +124,12 @@ func paymentRows(t *testing.T, db *sql.DB) []paymentRow {
 }
 
 // assertUnchanged checks that a failed batch left no trace.
-func assertUnchanged(t *testing.T, db *sql.DB, wantBalances map[string]int64) {
+func assertUnchanged(ctx context.Context, t *testing.T, db *sql.DB, wantBalances map[string]int64) {
 	t.Helper()
-	if got := balances(t, db); !reflect.DeepEqual(got, wantBalances) {
+	if got := balances(ctx, t, db); !reflect.DeepEqual(got, wantBalances) {
 		t.Errorf("balances = %v, want unchanged %v", got, wantBalances)
 	}
-	if rows := paymentRows(t, db); len(rows) != 0 {
+	if rows := paymentRows(ctx, t, db); len(rows) != 0 {
 		t.Errorf("payments rows = %v, want none", rows)
 	}
 }
@@ -140,8 +143,7 @@ func pay(payee string, cents int64, description string) payments.Payment {
 }
 
 func TestCreatePaymentsAggregatesDuplicatePayees(t *testing.T) {
-	db := openTestDB(t)
-	ctx := testContext(t)
+	db, ctx := openTestDB(t)
 	store := NewStore(db)
 
 	err := store.CreatePayments(ctx, batch(pinecrestUUID,
@@ -158,7 +160,7 @@ func TestCreatePaymentsAggregatesDuplicatePayees(t *testing.T) {
 		lopezUUID:     50000 + 30000,
 		nairUUID:      200000 + 5000,
 	}
-	if got := balances(t, db); !reflect.DeepEqual(got, wantBalances) {
+	if got := balances(ctx, t, db); !reflect.DeepEqual(got, wantBalances) {
 		t.Errorf("balances = %v, want %v", got, wantBalances)
 	}
 	wantRows := []paymentRow{
@@ -166,14 +168,13 @@ func TestCreatePaymentsAggregatesDuplicatePayees(t *testing.T) {
 		{pinecrestID, lopezID, 20000, "Invoice 2"},
 		{pinecrestID, nairID, 5000, ""},
 	}
-	if got := paymentRows(t, db); !reflect.DeepEqual(got, wantRows) {
+	if got := paymentRows(ctx, t, db); !reflect.DeepEqual(got, wantRows) {
 		t.Errorf("payments rows = %v, want %v", got, wantRows)
 	}
 }
 
 func TestCreatePaymentsExactBalance(t *testing.T) {
-	db := openTestDB(t)
-	ctx := testContext(t)
+	db, ctx := openTestDB(t)
 
 	err := NewStore(db).CreatePayments(ctx, batch(lopezUUID,
 		pay(nairUUID, 20000, "a"),
@@ -182,14 +183,13 @@ func TestCreatePaymentsExactBalance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreatePayments: %v", err)
 	}
-	if got := balances(t, db)[lopezUUID]; got != 0 {
+	if got := balances(ctx, t, db)[lopezUUID]; got != 0 {
 		t.Errorf("payer balance = %d, want 0", got)
 	}
 }
 
 func TestCreatePaymentsInsufficientFunds(t *testing.T) {
-	db := openTestDB(t)
-	ctx := testContext(t)
+	db, ctx := openTestDB(t)
 
 	// Each entry fits Lopez's $500 on its own; the batch total does not.
 	err := NewStore(db).CreatePayments(ctx, batch(lopezUUID,
@@ -199,7 +199,7 @@ func TestCreatePaymentsInsufficientFunds(t *testing.T) {
 	if !errors.Is(err, payments.ErrInsufficientFunds) {
 		t.Fatalf("err = %v, want %v", err, payments.ErrInsufficientFunds)
 	}
-	assertUnchanged(t, db, seedBalances)
+	assertUnchanged(ctx, t, db, seedBalances)
 }
 
 func TestCreatePaymentsFirmNotFound(t *testing.T) {
@@ -222,8 +222,7 @@ func TestCreatePaymentsFirmNotFound(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			db := openTestDB(t)
-			ctx := testContext(t)
+			db, ctx := openTestDB(t)
 
 			err := NewStore(db).CreatePayments(ctx, tt.batch)
 
@@ -231,19 +230,18 @@ func TestCreatePaymentsFirmNotFound(t *testing.T) {
 			if !errors.As(err, &notFound) || *notFound != tt.want {
 				t.Fatalf("err = %v, want %+v", err, tt.want)
 			}
-			assertUnchanged(t, db, seedBalances)
+			assertUnchanged(ctx, t, db, seedBalances)
 		})
 	}
 }
 
 // A failure after earlier writes in the same transaction must undo them all.
 func TestCreatePaymentsRollsBackOnFailure(t *testing.T) {
-	db := openTestDB(t)
-	ctx := testContext(t)
-	if _, err := db.Exec(`UPDATE firms SET balance_cents = $1 WHERE id = $2`, math.MaxInt32-100, nairID); err != nil {
+	db, ctx := openTestDB(t)
+	if _, err := db.ExecContext(ctx, `UPDATE firms SET balance_cents = $1 WHERE id = $2`, math.MaxInt32-100, nairID); err != nil {
 		t.Fatalf("set up balance: %v", err)
 	}
-	before := balances(t, db)
+	before := balances(ctx, t, db)
 
 	// The payer debit and Lopez's credit succeed; Nair's credit overflows INTEGER.
 	err := NewStore(db).CreatePayments(ctx, batch(pinecrestUUID,
@@ -253,15 +251,14 @@ func TestCreatePaymentsRollsBackOnFailure(t *testing.T) {
 	if !errors.Is(err, payments.ErrBalanceLimitExceeded) {
 		t.Fatalf("err = %v, want %v", err, payments.ErrBalanceLimitExceeded)
 	}
-	assertUnchanged(t, db, before)
+	assertUnchanged(ctx, t, db, before)
 }
 
 // A failure in the last write stage, after the payer debit and the payee
 // credits, must undo them too. The batch bypasses HTTP validation, so the
 // database's own description length check rejects the INSERT.
 func TestCreatePaymentsRollsBackWhenInsertFails(t *testing.T) {
-	db := openTestDB(t)
-	ctx := testContext(t)
+	db, ctx := openTestDB(t)
 
 	err := NewStore(db).CreatePayments(ctx, batch(pinecrestUUID,
 		pay(lopezUUID, 1000, "ok"),
@@ -272,14 +269,13 @@ func TestCreatePaymentsRollsBackWhenInsertFails(t *testing.T) {
 	if !errors.As(err, &pqErr) || pqErr.Constraint != "payments_description_max_length" {
 		t.Fatalf("err = %v, want a payments_description_max_length violation", err)
 	}
-	assertUnchanged(t, db, seedBalances)
+	assertUnchanged(ctx, t, db, seedBalances)
 }
 
 // Ten copies of a $13,251.25 batch against Pinecrest's $50,000: exactly three
 // fit, whichever order the transactions run in.
 func TestCreatePaymentsConcurrentBatchesFromOnePayer(t *testing.T) {
-	db := openTestDB(t)
-	ctx := testContext(t)
+	db, ctx := openTestDB(t)
 	store := NewStore(db)
 	b := batch(pinecrestUUID,
 		pay(lopezUUID, 120075, "Bookkeeping cleanup, 3 clients"),
@@ -306,21 +302,24 @@ func TestCreatePaymentsConcurrentBatchesFromOnePayer(t *testing.T) {
 	}
 
 	want := map[string]int64{pinecrestUUID: 1024625, lopezUUID: 410225, nairUUID: 3815150}
-	if got := balances(t, db); !reflect.DeepEqual(got, want) {
+	if got := balances(ctx, t, db); !reflect.DeepEqual(got, want) {
 		t.Errorf("balances = %v, want %v", got, want)
 	}
-	if rows := paymentRows(t, db); len(rows) != 3*len(b.Payments) {
+	if rows := paymentRows(ctx, t, db); len(rows) != 3*len(b.Payments) {
 		t.Errorf("payments rows = %d, want %d", len(rows), 3*len(b.Payments))
 	}
 }
 
 // Transactions paying in opposite directions (A -> B and B -> A) would
-// deadlock with payer-first locking. With ascending-id locking every one of
-// them must succeed, and the total amount of money must not change.
+// deadlock with payer-first locking. With ascending-id locking no deadlock may
+// happen at all: CreatePayments retries deadlocks, so a passing payment alone
+// would hide a lock-order regression; the test therefore also requires zero
+// retries. Every payment must succeed and money must be conserved.
 func TestCreatePaymentsOpposingDirectionsDoNotDeadlock(t *testing.T) {
-	db := openTestDB(t)
-	ctx := testContext(t)
+	db, ctx := openTestDB(t)
 	store := NewStore(db)
+	var retries atomic.Int32
+	store.onRetry = func(error) { retries.Add(1) }
 	batches := []payments.Batch{
 		batch(pinecrestUUID, pay(lopezUUID, 1, "")),
 		batch(lopezUUID, pay(pinecrestUUID, 1, "")),
@@ -343,9 +342,12 @@ func TestCreatePaymentsOpposingDirectionsDoNotDeadlock(t *testing.T) {
 			t.Errorf("unexpected error: %v", err)
 		}
 	}
+	if n := retries.Load(); n != 0 {
+		t.Errorf("retries = %d, want 0: deadlocks happened, so the lock order is broken", n)
+	}
 
 	var total int64
-	for _, b := range balances(t, db) {
+	for _, b := range balances(ctx, t, db) {
 		total += b
 	}
 	if want := int64(5000000 + 50000 + 200000); total != want {

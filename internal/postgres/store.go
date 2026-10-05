@@ -21,11 +21,34 @@ import (
 // all coordination happens through row locks.
 type Store struct {
 	db *sql.DB
+
+	// PostgreSQL-side limits for each transaction, see setTimeouts.
+	lockTimeout              time.Duration
+	statementTimeout         time.Duration
+	idleInTransactionTimeout time.Duration
+
+	// onRetry, when set, is called before each retry. Tests use it to see
+	// whether a retry happened.
+	onRetry func(err error)
 }
+
+// Default database timeouts. They sit below the request deadline set by the
+// caller, which bounds the whole operation including retries:
+// lock timeout < statement timeout < request deadline < HTTP write timeout.
+const (
+	defaultLockTimeout              = 2 * time.Second
+	defaultStatementTimeout         = 5 * time.Second
+	defaultIdleInTransactionTimeout = 5 * time.Second
+)
 
 // NewStore returns a Store that uses db.
 func NewStore(db *sql.DB) *Store {
-	return &Store{db: db}
+	return &Store{
+		db:                       db,
+		lockTimeout:              defaultLockTimeout,
+		statementTimeout:         defaultStatementTimeout,
+		idleInTransactionTimeout: defaultIdleInTransactionTimeout,
+	}
 }
 
 type firm struct {
@@ -57,17 +80,35 @@ func (s *Store) CreatePayments(ctx context.Context, batch payments.Batch) error 
 		return err
 	}
 
+	err = retryAborted(ctx, s.onRetry, func() error {
+		return s.createPaymentsOnce(ctx, batch, total)
+	})
+	if isTimeout(err) {
+		return fmt.Errorf("%w: %w", payments.ErrBusy, err)
+	}
+	return err
+}
+
+// retryAborted runs op until it succeeds, fails with an error that is not
+// retryable, or has run maxAttempts times, waiting a jittered backoff between
+// attempts. If ctx ends during the backoff, the returned error wraps both the
+// context error and the last op error, so errors.Is matches either.
+func retryAborted(ctx context.Context, onRetry func(error), op func() error) error {
 	for attempt := 1; ; attempt++ {
-		err := s.createPaymentsOnce(ctx, batch, total)
+		err := op()
 		if err == nil || attempt == maxAttempts || !isRetryable(err) {
 			return err
 		}
-		if sleep(ctx, retryDelay(attempt)) != nil {
-			return err // the request ended; nothing was committed
+		if ctxErr := sleep(ctx, retryDelay(attempt)); ctxErr != nil {
+			return fmt.Errorf("%w (retry interrupted after: %w)", ctxErr, err)
+		}
+		if onRetry != nil {
+			onRetry(err)
 		}
 	}
 }
 
+// createPaymentsOnce applies the batch in a single transaction attempt.
 func (s *Store) createPaymentsOnce(ctx context.Context, batch payments.Batch, total int64) error {
 	// READ COMMITTED is PostgreSQL's default, set explicitly because the design
 	// relies on it: after waiting for a row lock, SELECT ... FOR UPDATE returns
@@ -78,6 +119,10 @@ func (s *Store) createPaymentsOnce(ctx context.Context, batch payments.Batch, to
 	}
 	// Rolls back on every early return; a no-op after a successful Commit.
 	defer tx.Rollback()
+
+	if err := s.setTimeouts(ctx, tx); err != nil {
+		return err
+	}
 
 	firms, err := lockFirms(ctx, tx, firmUUIDs(batch))
 	if err != nil {
@@ -123,16 +168,11 @@ func (s *Store) createPaymentsOnce(ctx context.Context, batch payments.Batch, to
 	return nil
 }
 
-// commitDefinitelyFailed reports whether a failed Commit is known not to have
-// committed anything:
-//   - a context error or sql.ErrTxDone: database/sql checks the context before
-//     sending COMMIT and rolls back instead, so COMMIT was never sent. Once it
-//     is sent, lib/pq does not interrupt it, so a request deadline cannot leave
-//     COMMIT half-way;
-//   - a server error or pq.ErrInFailedTransaction: PostgreSQL answered COMMIT
-//     by rolling back.
-//
-// Anything else, such as a dropped connection, leaves the outcome unknown.
+// commitDefinitelyFailed reports whether Commit is known to have rolled back.
+// For this single, non-concurrent Commit call, context errors and sql.ErrTxDone
+// mean database/sql rolled back before sending COMMIT. PostgreSQL errors and
+// pq.ErrInFailedTransaction also indicate rollback. Transport errors leave the
+// outcome unknown because COMMIT may have reached the server.
 func commitDefinitelyFailed(err error) bool {
 	var pqErr *pq.Error
 	return errors.Is(err, context.Canceled) ||
@@ -142,20 +182,29 @@ func commitDefinitelyFailed(err error) bool {
 		errors.As(err, &pqErr)
 }
 
-// isRetryable reports errors after which PostgreSQL has definitely aborted the
-// transaction, so running the whole transaction again cannot apply the batch
-// twice: deadlock_detected (40P01) and serialization_failure (40001, only
-// possible under stricter isolation levels).
-//
-// Everything else is returned as is: an unknown commit outcome may already have
-// paid, and a lock timeout (55P03) means contention that a retry within the
-// same request would mostly wait out again.
+// isRetryable reports whether the entire transaction should be retried.
+// Deadlocks and serialization failures abort the transaction and are safe to
+// retry. An unknown commit result is not retryable because the payments may
+// have been applied. Lock timeouts are not retried because the blocking
+// transaction is likely still running.
 func isRetryable(err error) bool {
 	if errors.Is(err, payments.ErrOutcomeUnknown) {
 		return false
 	}
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && (pqErr.Code == "40P01" || pqErr.Code == "40001")
+}
+
+// isTimeout reports a PostgreSQL timeout: lock_not_available (55P03, from
+// lock_timeout) or query_canceled (57014, from statement_timeout). A cancelled
+// context is reported by lib/pq as the context error instead. An unknown
+// commit outcome is never reported as a timeout.
+func isTimeout(err error) bool {
+	if errors.Is(err, payments.ErrOutcomeUnknown) {
+		return false
+	}
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && (pqErr.Code == "55P03" || pqErr.Code == "57014")
 }
 
 // retryDelay returns a jittered backoff: about 20ms before the second
@@ -174,6 +223,31 @@ func sleep(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// setTimeouts limits this transaction on the PostgreSQL side, so it cannot wait
+// forever even if the caller's context has no deadline:
+//   - lock_timeout bounds each wait for a row lock (fails with 55P03);
+//   - statement_timeout bounds each statement (fails with 57014);
+//   - idle_in_transaction_session_timeout ends the session, releasing its
+//     locks, if the application stalls between statements.
+//
+// set_config(..., true) is SET LOCAL: the values end with the transaction and
+// never leak to other users of the pooled connection.
+func (s *Store) setTimeouts(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `SELECT
+		set_config('lock_timeout', $1, true),
+		set_config('statement_timeout', $2, true),
+		set_config('idle_in_transaction_session_timeout', $3, true)`,
+		pgDuration(s.lockTimeout), pgDuration(s.statementTimeout), pgDuration(s.idleInTransactionTimeout))
+	if err != nil {
+		return fmt.Errorf("set timeouts: %w", err)
+	}
+	return nil
+}
+
+func pgDuration(d time.Duration) string {
+	return fmt.Sprintf("%dms", d.Milliseconds())
 }
 
 // firmUUIDs returns the payer and payee UUIDs without duplicates.
