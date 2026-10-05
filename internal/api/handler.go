@@ -163,10 +163,11 @@ func writeServiceError(w http.ResponseWriter, batch payments.Batch, err error) {
 		writeError(w, http.StatusUnprocessableEntity, codeBalanceLimitExceeded,
 			"a payee's balance would exceed the largest supported balance; nothing was paid", "")
 	case errors.Is(err, payments.ErrOutcomeUnknown):
-		log.Printf("create payments for payer %s: %v", batch.PayerFirmUUID, err)
+		logOutcomeUnknown(batch, err)
 		writeError(w, http.StatusInternalServerError, codeOutcomeUnknown,
-			"the database connection was lost while committing, so the payments may or may not "+
-				"have been applied; check the balances before retrying, or a retry may pay twice", "")
+			"the database connection was lost while committing, so these payments may or may not "+
+				"have been applied. Do not retry automatically, a retry may pay twice; reconcile "+
+				"against the payment records before resubmitting", "")
 	case errors.Is(err, payments.ErrBusy):
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, codeBusy,
@@ -180,6 +181,24 @@ func writeServiceError(w http.ResponseWriter, batch payments.Batch, err error) {
 		writeError(w, http.StatusInternalServerError, codeInternal,
 			"internal error; nothing was paid", "")
 	}
+}
+
+// logOutcomeUnknown records enough to reconcile a batch whose commit outcome
+// is unknown: the payer, the total and every entry's payee and amount, in
+// request order (the order of the payment rows if it committed). Balances
+// cannot answer that question while other payments run concurrently.
+// Descriptions are left out of the log.
+func logOutcomeUnknown(batch payments.Batch, err error) {
+	total, _ := batch.TotalCents()
+	var entries strings.Builder
+	for i, p := range batch.Payments {
+		if i > 0 {
+			entries.WriteString(", ")
+		}
+		fmt.Fprintf(&entries, "%s %s", p.PayeeFirmUUID, formatCents(p.AmountCents))
+	}
+	log.Printf("commit outcome unknown for payer %s (%d payments, total %s): [%s]: %v",
+		batch.PayerFirmUUID, len(batch.Payments), formatCents(total), entries.String(), err)
 }
 
 // payeeField returns the field path of the first payment to the given payee.

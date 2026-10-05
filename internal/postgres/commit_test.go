@@ -27,7 +27,7 @@ func TestCreatePaymentsConnectionLostDuringCommit(t *testing.T) {
 
 	err := store.CreatePayments(ctx, batch(pinecrestUUID, pay(lopezUUID, 100, "committed, reply lost")))
 
-	if !proxy.dropped.Load() {
+	if !proxy.triggered.Load() {
 		t.Fatal("the proxy never saw COMMIT, so the test did not exercise a lost commit reply")
 	}
 	if !errors.Is(err, payments.ErrOutcomeUnknown) {
@@ -56,7 +56,7 @@ func TestRetryingAfterLostCommitReplyPaysTwice(t *testing.T) {
 	b := batch(pinecrestUUID, pay(lopezUUID, 100, "sent twice"))
 
 	err := store.CreatePayments(ctx, b)
-	if !proxy.dropped.Load() || !errors.Is(err, payments.ErrOutcomeUnknown) {
+	if !proxy.triggered.Load() || !errors.Is(err, payments.ErrOutcomeUnknown) {
 		t.Fatalf("first attempt: err = %v, want %v after a lost COMMIT reply", err, payments.ErrOutcomeUnknown)
 	}
 
@@ -74,10 +74,11 @@ func TestRetryingAfterLostCommitReplyPaysTwice(t *testing.T) {
 	}
 }
 
-// proxiedStore returns a Store whose connections go through a commitDropProxy.
-func proxiedStore(t *testing.T) (*Store, *commitDropProxy) {
+// proxiedStore returns a Store whose connections go through a faultProxy that
+// drops the reply to the first COMMIT.
+func proxiedStore(t *testing.T) (*Store, *faultProxy) {
 	t.Helper()
-	proxy := startCommitDropProxy(t)
+	proxy := startFaultProxy(t, commitMessage, dropReply)
 	db, err := sql.Open("postgres", proxy.dsn)
 	if err != nil {
 		t.Fatalf("open proxied database: %v", err)
@@ -90,29 +91,42 @@ func proxiedStore(t *testing.T) (*Store, *commitDropProxy) {
 // ('Q', int32 length including itself, "COMMIT\x00").
 var commitMessage = []byte{'Q', 0, 0, 0, 11, 'C', 'O', 'M', 'M', 'I', 'T', 0}
 
-// commitDropProxy relays TCP traffic between the store and PostgreSQL. The
-// first time a client sends COMMIT, the proxy forwards it, waits for
-// PostgreSQL's reply, and then closes the connection instead of relaying the
-// reply: the transaction is committed, but the client never learns it.
-type commitDropProxy struct {
-	dsn     string
-	target  string
-	ln      net.Listener
-	dropped atomic.Bool
-	wg      sync.WaitGroup
+// faultMode is what a faultProxy does once a client sends its trigger message.
+type faultMode int
+
+const (
+	// dropReply forwards the trigger, waits for PostgreSQL's reply and closes
+	// the connection instead of relaying it. Only the first trigger is faulted.
+	dropReply faultMode = iota
+	// stall forwards the trigger and then never relays another byte on that
+	// connection, like a server that stopped answering. Every trigger is
+	// faulted.
+	stall
+)
+
+// faultProxy relays TCP traffic between the store and PostgreSQL and injects
+// one kind of fault, triggered by a message the client sends.
+type faultProxy struct {
+	dsn       string
+	target    string
+	ln        net.Listener
+	trigger   []byte
+	mode      faultMode
+	triggered atomic.Bool // the fault has happened at least once
+	wg        sync.WaitGroup
 }
 
-func startCommitDropProxy(t *testing.T) *commitDropProxy {
+func startFaultProxy(t *testing.T, trigger []byte, mode faultMode) *faultProxy {
 	t.Helper()
 	u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
 	if err != nil || u.Host == "" {
-		t.Skip("TEST_DATABASE_URL must be a postgres:// URL for the proxy test")
+		t.Skip("TEST_DATABASE_URL must be a postgres:// URL for the proxy tests")
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	p := &commitDropProxy{target: u.Host, ln: ln}
+	p := &faultProxy{target: u.Host, ln: ln, trigger: trigger, mode: mode}
 	u.Host = ln.Addr().String()
 	q := u.Query()
 	q.Set("sslmode", "disable") // the proxy must see plain protocol messages
@@ -128,7 +142,7 @@ func startCommitDropProxy(t *testing.T) *commitDropProxy {
 	return p
 }
 
-func (p *commitDropProxy) serve() {
+func (p *faultProxy) serve() {
 	defer p.wg.Done()
 	for {
 		client, err := p.ln.Accept()
@@ -141,7 +155,7 @@ func (p *commitDropProxy) serve() {
 			continue
 		}
 		p.wg.Add(2)
-		var dropNextReply atomic.Bool
+		var faulted atomic.Bool // this connection has sent the trigger
 		closeBoth := func() { client.Close(); server.Close() }
 
 		// client -> server
@@ -152,8 +166,9 @@ func (p *commitDropProxy) serve() {
 			for {
 				n, err := client.Read(buf)
 				if n > 0 {
-					if !p.dropped.Load() && bytes.Contains(buf[:n], commitMessage) {
-						dropNextReply.Store(true) // before forwarding, so the reply cannot slip through
+					armed := p.mode == stall || !p.triggered.Load()
+					if armed && bytes.Contains(buf[:n], p.trigger) {
+						faulted.Store(true) // before forwarding, so the reply cannot slip through
 					}
 					if _, werr := server.Write(buf[:n]); werr != nil {
 						return
@@ -172,9 +187,12 @@ func (p *commitDropProxy) serve() {
 			buf := make([]byte, 32<<10)
 			for {
 				n, err := server.Read(buf)
-				if n > 0 && dropNextReply.Load() {
-					p.dropped.Store(true)
-					return // PostgreSQL has answered COMMIT; the client never sees it
+				if n > 0 && faulted.Load() {
+					p.triggered.Store(true)
+					if p.mode == dropReply {
+						return // PostgreSQL has answered; the client never sees it
+					}
+					continue // stall: swallow everything from now on
 				}
 				if n > 0 {
 					if _, werr := client.Write(buf[:n]); werr != nil {

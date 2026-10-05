@@ -76,7 +76,7 @@ func openDB(dsn string) (*sql.DB, error) {
 	if dsn == "" {
 		return nil, errors.New("DATABASE_URL is not set")
 	}
-	db, err := sql.Open("postgres", dsn)
+	db, err := postgres.Open(dsn, postgres.DefaultIOTimeout)
 	if err != nil {
 		return nil, err
 	}

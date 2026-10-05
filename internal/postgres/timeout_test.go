@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -155,10 +156,13 @@ func TestClassifyBusy(t *testing.T) {
 		{"request deadline during the retry backoff",
 			fmt.Errorf("%w (retry interrupted after: %w)", context.DeadlineExceeded, deadlock), false, context.DeadlineExceeded},
 		{"unknown commit outcome", fmt.Errorf("%w: commit: %w", payments.ErrOutcomeUnknown, deadlock), false, payments.ErrOutcomeUnknown},
+		{"database stopped answering before COMMIT", fmt.Errorf("begin transaction: %w", os.ErrDeadlineExceeded), true, os.ErrDeadlineExceeded},
+		{"database stopped answering during COMMIT",
+			fmt.Errorf("%w: commit: %w", payments.ErrOutcomeUnknown, os.ErrDeadlineExceeded), false, payments.ErrOutcomeUnknown},
 		{"business error", payments.ErrInsufficientFunds, false, payments.ErrInsufficientFunds},
 	}
 	for _, tt := range tests {
-		got := classifyBusy(tt.err)
+		got := classifyBusy(context.Background(), tt.err)
 		if errors.Is(got, payments.ErrBusy) != tt.wantBusy {
 			t.Errorf("%s: classifyBusy(%v) = %v, want busy = %v", tt.name, tt.err, got, tt.wantBusy)
 		}
@@ -169,4 +173,74 @@ func TestClassifyBusy(t *testing.T) {
 			t.Errorf("%s: classifyBusy(nil) = %v, want nil", tt.name, got)
 		}
 	}
+}
+
+// When the request's context has ended, a statement cancelled by it is a
+// timeout, not "busy". Success, an unknown commit outcome and business errors
+// are never relabelled, as they do not mean "nothing was paid because of the
+// deadline".
+func TestClassifyBusyAfterContextEnded(t *testing.T) {
+	ended, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	canceled := &pq.Error{Code: "57014"}
+
+	tests := []struct {
+		name     string
+		err      error
+		wantSame bool  // returned unchanged
+		wantIs   error // must match, if set
+	}{
+		{"success", nil, true, nil},
+		{"statement cancelled by the deadline", fmt.Errorf("insert payments: %w", canceled), false, context.DeadlineExceeded},
+		{"unknown commit outcome", fmt.Errorf("%w: commit: %w", payments.ErrOutcomeUnknown, canceled), true, payments.ErrOutcomeUnknown},
+		{"insufficient funds", fmt.Errorf("%w: balance 1", payments.ErrInsufficientFunds), true, payments.ErrInsufficientFunds},
+	}
+	for _, tt := range tests {
+		got := classifyBusy(ended, tt.err)
+		if tt.wantSame && got != tt.err {
+			t.Errorf("%s: classifyBusy = %v, want it unchanged (%v)", tt.name, got, tt.err)
+		}
+		if tt.wantIs != nil && !errors.Is(got, tt.wantIs) {
+			t.Errorf("%s: classifyBusy = %v, want it to match %v", tt.name, got, tt.wantIs)
+		}
+		if errors.Is(got, payments.ErrBusy) {
+			t.Errorf("%s: classifyBusy = %v, want it not to be busy", tt.name, got)
+		}
+	}
+	var pqErr *pq.Error
+	if got := classifyBusy(ended, canceled); !errors.As(got, &pqErr) {
+		t.Errorf("classifyBusy = %v, want the 57014 error to stay wrapped", got)
+	}
+}
+
+// A request deadline that ends while a statement is blocked: the INSERT waits
+// on a table lock held elsewhere, and the database's own timeouts are longer
+// than the deadline. The result must be the context error, not ErrBusy, and
+// nothing may change.
+func TestCreatePaymentsDeadlineDuringStatement(t *testing.T) {
+	db, testCtx := openTestDB(t)
+	store := NewStore(db)
+	store.statementTimeout = 5 * time.Second
+	store.lockTimeout = 5 * time.Second
+
+	other, err := db.BeginTx(testCtx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer other.Rollback()
+	if _, err := other.ExecContext(testCtx, `LOCK TABLE payments IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("lock payments: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(testCtx, 300*time.Millisecond)
+	defer cancel()
+	err = store.CreatePayments(ctx, batch(pinecrestUUID, pay(lopezUUID, 100, "")))
+
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, payments.ErrBusy) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded and not ErrBusy", err)
+	}
+	if err := other.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	assertUnchanged(testCtx, t, db, seedBalances)
 }

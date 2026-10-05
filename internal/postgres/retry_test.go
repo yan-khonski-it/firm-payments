@@ -148,13 +148,17 @@ func TestCreatePaymentsDeadlockWithAnotherTransaction(t *testing.T) {
 	if _, err := other.ExecContext(ctx, `SELECT 1 FROM firms WHERE id = $1 FOR UPDATE`, nairID); err != nil {
 		t.Fatalf("lock Nair: %v", err)
 	}
+	var otherPID int
+	if err := other.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&otherPID); err != nil {
+		t.Fatalf("read the other transaction's process id: %v", err)
+	}
 
 	// CreatePayments locks Pinecrest (id 1), then waits for Nair.
 	done := make(chan error, 1)
 	go func() {
 		done <- store.CreatePayments(ctx, batch(pinecrestUUID, pay(nairUUID, 100, "deadlocked")))
 	}()
-	waitForLockWaiters(ctx, t, db, 1)
+	waitUntilBlockedBy(ctx, t, db, otherPID)
 
 	// Now the other transaction wants Pinecrest: a cycle, which PostgreSQL
 	// breaks by aborting one of the two.
@@ -193,17 +197,21 @@ func isDeadlock(err error) bool {
 	return errors.As(err, &pqErr) && pqErr.Code == "40P01"
 }
 
-// waitForLockWaiters waits until n sessions are blocked on a row lock.
-func waitForLockWaiters(ctx context.Context, t *testing.T, db *sql.DB, n int) {
+// waitUntilBlockedBy waits until some session is waiting for a lock held by
+// the session with process id blocker. Other sessions waiting for unrelated
+// locks, such as another package's test waiting for the shared test database,
+// do not count. Database tests run one at a time, so the blocked session is
+// the one under test.
+func waitUntilBlockedBy(ctx context.Context, t *testing.T, db *sql.DB, blocker int) {
 	t.Helper()
 	for {
-		var waiting int
-		err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting)
+		var blocked bool
+		err := db.QueryRowContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))`, blocker).Scan(&blocked)
 		if err != nil {
-			t.Fatalf("waiting for %d lock waiter(s): %v", n, err)
+			t.Fatalf("waiting for a session blocked by process %d: %v", blocker, err)
 		}
-		if waiting >= n {
+		if blocked {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

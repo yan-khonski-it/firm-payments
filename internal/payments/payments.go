@@ -22,9 +22,10 @@ var (
 	// not have been applied, so retrying it blindly can pay twice.
 	ErrOutcomeUnknown = errors.New("payments: outcome unknown")
 	// ErrBusy is returned when the database could not complete the batch for
-	// now: a row lock or a statement took longer than its timeout, or the
-	// transaction was still being aborted (deadlock) after the last retry.
-	// Nothing is changed, and the request can be retried later.
+	// now: a row lock or a statement took longer than its timeout, the
+	// transaction was still being aborted (deadlock) after the last retry, or
+	// the database stopped answering before COMMIT. Nothing is changed, and the
+	// request can be retried later.
 	ErrBusy = errors.New("payments: database busy")
 )
 

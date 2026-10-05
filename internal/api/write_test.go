@@ -3,11 +3,14 @@ package api
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 	"testing"
+
+	"firm-payments/internal/payments"
 )
 
 var errDelivery = errors.New("connection reset by peer")
@@ -80,5 +83,33 @@ func TestCreatePaymentsLogsUndeliveredConfirmation(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "payments committed for payer 3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41 (1 payments, 1200.75) but the 201 response was not delivered") {
 		t.Errorf("log = %q, want the undelivered confirmation logged", logs.String())
+	}
+}
+
+// An unknown commit outcome is logged with what an operator needs to reconcile
+// it against the payment rows, without the descriptions.
+func TestOutcomeUnknownIsLoggedForReconciliation(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	body := `{"payer_firm_uuid":"3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41","payments":[
+		{"amount":"6250","payee_firm_uuid":"e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25","description":"secret note"},
+		{"amount":"1200.75","payee_firm_uuid":"8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10","description":"another"}]}`
+	svc := &fakePaymentService{err: fmt.Errorf("%w: commit: unexpected EOF", payments.ErrOutcomeUnknown)}
+
+	rec := serveWith(svc, newRequest(http.MethodPost, "/payments", body))
+
+	assertErrorResponse(t, rec, http.StatusInternalServerError, codeOutcomeUnknown, "")
+	if strings.Contains(rec.Body.String(), "balance") {
+		t.Errorf("response still suggests checking balances: %s", rec.Body.String())
+	}
+	want := "commit outcome unknown for payer 3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41 (2 payments, total 7450.75): " +
+		"[e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25 6250.00, 8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10 1200.75]"
+	if !strings.Contains(logs.String(), want) {
+		t.Errorf("log = %q, want it to contain %q", logs.String(), want)
+	}
+	if strings.Contains(logs.String(), "secret note") {
+		t.Errorf("log contains a description: %q", logs.String())
 	}
 }

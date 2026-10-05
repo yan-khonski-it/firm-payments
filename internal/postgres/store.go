@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -83,19 +84,37 @@ func (s *Store) CreatePayments(ctx context.Context, batch payments.Batch) error 
 	err = retryAborted(ctx, s.onRetry, func() error {
 		return s.createPaymentsOnce(ctx, batch, total)
 	})
-	return classifyBusy(err)
+	return classifyBusy(ctx, err)
 }
 
-// classifyBusy wraps the errors that mean "temporarily unavailable, nothing
-// changed" in payments.ErrBusy: a PostgreSQL timeout, or an abort (deadlock,
-// serialization failure) that still happened on the last attempt.
-// A cancelled or expired request keeps its context error, and an unknown
-// commit outcome is never relabelled.
-func classifyBusy(err error) error {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+// classifyBusy labels the result of CreatePayments, in this order:
+//
+//  1. Success and an unknown commit outcome (including an I/O timeout during
+//     COMMIT) are returned unchanged: the payments may have been applied, so
+//     nothing else may be claimed about them.
+//  2. A statement cancelled because the request's context ended is reported
+//     as the context error. lib/pq surfaces that cancellation as PostgreSQL's
+//     query_canceled (57014), which on its own looks like statement_timeout.
+//     The original error stays wrapped.
+//  3. Context errors are returned unchanged.
+//  4. Errors meaning "temporarily unavailable, nothing changed" are wrapped
+//     in payments.ErrBusy: a PostgreSQL timeout, an abort (deadlock,
+//     serialization failure) that still happened on the last attempt, or a
+//     database that stopped answering before COMMIT (see DefaultIOTimeout).
+//
+// Other errors, such as insufficient funds, are returned unchanged even if
+// the context has ended meanwhile.
+func classifyBusy(ctx context.Context, err error) error {
+	if err == nil || errors.Is(err, payments.ErrOutcomeUnknown) {
 		return err
 	}
-	if isTimeout(err) || isRetryable(err) {
+	if ctxErr := ctx.Err(); ctxErr != nil && isQueryCanceled(err) {
+		return fmt.Errorf("%w: %w", ctxErr, err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if isTimeout(err) || isRetryable(err) || errors.Is(err, os.ErrDeadlineExceeded) {
 		return fmt.Errorf("%w: %w", payments.ErrBusy, err)
 	}
 	return err
@@ -208,8 +227,9 @@ func isRetryable(err error) bool {
 }
 
 // isTimeout reports a PostgreSQL timeout: lock_not_available (55P03, from
-// lock_timeout) or query_canceled (57014, from statement_timeout). A cancelled
-// context is reported by lib/pq as the context error instead. An unknown
+// lock_timeout) or query_canceled (57014, from statement_timeout). lib/pq also
+// returns 57014 when the request's context ends during a statement;
+// classifyBusy checks the context first to tell the two apart. An unknown
 // commit outcome is never reported as a timeout.
 func isTimeout(err error) bool {
 	if errors.Is(err, payments.ErrOutcomeUnknown) {
@@ -217,6 +237,12 @@ func isTimeout(err error) bool {
 	}
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && (pqErr.Code == "55P03" || pqErr.Code == "57014")
+}
+
+// isQueryCanceled reports PostgreSQL's query_canceled (57014).
+func isQueryCanceled(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "57014"
 }
 
 // retryDelay returns a jittered backoff: about 20ms before the second

@@ -164,9 +164,10 @@ func newInstance(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// openDB opens a pool the way the server does, with bounded reads.
 func openDB(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("postgres", dsn)
+	db, err := postgres.Open(dsn, postgres.DefaultIOTimeout)
 	if err != nil {
 		t.Fatalf("open database: %v", err)
 	}

@@ -17,3 +17,16 @@ MY: my comments or notes.
 
 
 Q: GPT: Review readme file. Help me to improve its structure.
+
+
+# Full conversations
+
+ChatGPT
+
+https://chatgpt.com/s/cx_6ac31e396b28819184ca266eeb74811e
+
+
+Claude
+
+https://claude.ai/share/487a8be6-327d-4da6-beb7-5d3261dd0675
+
