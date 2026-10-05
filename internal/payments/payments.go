@@ -4,11 +4,38 @@ package payments
 
 import (
 	"errors"
+	"fmt"
 	"math"
 )
 
-// ErrTotalOverflow is returned when a batch total does not fit in int64.
-var ErrTotalOverflow = errors.New("payments: batch total overflows int64")
+var (
+	// ErrTotalOverflow is returned when a batch total does not fit in int64.
+	ErrTotalOverflow = errors.New("payments: batch total overflows int64")
+	// ErrInsufficientFunds is returned when the payer's balance cannot cover
+	// the whole batch. Nothing is changed.
+	ErrInsufficientFunds = errors.New("payments: insufficient funds")
+	// ErrBalanceLimitExceeded is returned when a credit would push a payee's
+	// balance past what the INTEGER balance column can hold. Nothing is changed.
+	ErrBalanceLimitExceeded = errors.New("payments: payee balance limit exceeded")
+	// ErrOutcomeUnknown is returned when COMMIT was sent but its result never
+	// arrived, for example because the connection dropped. The batch may or may
+	// not have been applied, so retrying it blindly can pay twice.
+	ErrOutcomeUnknown = errors.New("payments: outcome unknown")
+)
+
+// FirmNotFoundError reports a firm referenced by a batch that does not exist.
+type FirmNotFoundError struct {
+	FirmUUID string
+	IsPayer  bool
+}
+
+func (e *FirmNotFoundError) Error() string {
+	role := "payee"
+	if e.IsPayer {
+		role = "payer"
+	}
+	return fmt.Sprintf("payments: %s firm %s not found", role, e.FirmUUID)
+}
 
 // Batch is a validated bulk payment: one payer paying one or more payees.
 type Batch struct {
