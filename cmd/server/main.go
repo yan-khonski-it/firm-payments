@@ -19,9 +19,12 @@ func main() {
 		addr = ":8080"
 	}
 
+	// No payment service yet: the stub handler does not call it.
+	router := api.NewRouter(nil)
+
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.NewRouter(),
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

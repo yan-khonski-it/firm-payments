@@ -27,7 +27,6 @@ $env:DATABASE_URL = "postgres://app:app@localhost:5432/orders?sslmode=disable"
 
 Apply migrations:
 ```shell
-go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
 go run -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@latest -path ./sql -database $env:DATABASE_URL up
 ```
 Run the service:
