@@ -164,6 +164,37 @@ curl -i -X POST http://localhost:8080/payments \
 ```
 
 
+## Solution approach
+
+### Architecture
+
+### Money representation and database constraints
+
+### Transaction and concurrency strategy
+
+### Timeouts and retries
+
+### Alternatives considered
+
+
+## Limitations and possible improvements
+
+### Contention and scalability
+
+### Other production improvements
+
+### Idempotency
+Idempotency is not supported. Every request is treated as a new payment batch, so resubmitting the same request
+may execute it again. If a request times out or the client connection fails,
+the transaction may still commit even though the client receives no response.
+Retrying the request could then execute the payments twice.
+
+The service does not retry transactions with an unknown commit outcome,
+but it cannot prevent client retries.
+A future implementation could accept an Idempotency-Key and store it atomically with the payments and result,
+allowing repeated requests to return the stored result without executing the batch again.
+
+
 ## AI assistance
 
 I used Claude Opus 5.5, OpenAI models (mostly Sol 6.1), and GitHub Copilot to assist with requirements, 

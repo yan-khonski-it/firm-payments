@@ -117,11 +117,17 @@ func (h *handler) createPayments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	total, _ := batch.TotalCents() // cannot fail: CreatePayments already computed it
-	writeJSON(w, http.StatusCreated, createPaymentsResponse{
+	err := writeJSON(w, http.StatusCreated, createPaymentsResponse{
 		PayerFirmUUID: batch.PayerFirmUUID,
 		PaymentCount:  len(batch.Payments),
 		TotalAmount:   formatCents(total),
 	})
+	if err != nil {
+		// The payments are committed; only the confirmation was lost. Nothing is
+		// retried here, as that would pay twice.
+		log.Printf("payments committed for payer %s (%d payments, %s) but the 201 response was not delivered: %v",
+			batch.PayerFirmUUID, len(batch.Payments), formatCents(total), err)
+	}
 }
 
 // setConnDeadlines makes reading the body stop at the request deadline and
@@ -192,11 +198,24 @@ func formatCents(cents int64) string {
 }
 
 func writeError(w http.ResponseWriter, status int, code, message, field string) {
-	writeJSON(w, status, errorResponse{Error: errorBody{Code: code, Message: message, Field: field}})
+	err := writeJSON(w, status, errorResponse{Error: errorBody{Code: code, Message: message, Field: field}})
+	if err != nil {
+		log.Printf("could not deliver the %d %s response: %v", status, code, err)
+	}
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// writeJSON writes v as the response and flushes it. Without the flush the
+// small response would sit in the server's buffer until the handler returns,
+// and a failed delivery (client gone, write deadline passed) would never be
+// reported here.
+func writeJSON(w http.ResponseWriter, status int, v any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		return err
+	}
+	if err := http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	return nil
 }
