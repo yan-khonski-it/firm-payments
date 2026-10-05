@@ -1,4 +1,4 @@
-# requirements
+# 01-requirements
 
 Q: GPT: Recall dining philosophers problem. Different approaches, the most simple, LR, LLR.
 A: Different strategies, how a deadlock can be avoided. Worst case concurrency.
