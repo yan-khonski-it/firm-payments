@@ -14,3 +14,6 @@ Q: - my question or prompt
 A: answer or summary of the answer.
 
 MY: my comments or notes.
+
+
+Q: GPT: Review readme file. Help me to improve its structure.

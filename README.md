@@ -14,6 +14,7 @@ Run all commands below from the repository root.
 ## Setup
 
 Clone the repository:
+
 ```shell
 git clone https://github.com/yan-khonski-it/firm-payments.git
 cd firm-payments
@@ -163,27 +164,102 @@ curl -i -X POST http://localhost:8080/payments \
   --data-binary "@payment-body.json"
 ```
 
-
 ## Solution approach
-
-### Architecture
 
 ### Money representation and database constraints
 
+Amounts are parsed from USD strings into integer cents without floating-point arithmetic. Go uses int64 for
+calculations, while PostgreSQL uses INTEGER to match the assignment schema. Individual amounts and balances are limited
+to 2,147,483,647 cents ($21,474,836.47); a payee balance overflow rolls back the entire batch.
+Database constraints enforce non-negative balances, positive payment amounts, existing payer and payee references, no
+self-payments, unique firm UUIDs, and descriptions of at most 500 characters. Required columns are NOT NULL. These
+constraints complement request validation and protect the data from invalid writes.
+
 ### Transaction and concurrency strategy
+
+Each payment batch runs in one PostgreSQL transaction at READ COMMITTED isolation. The service locks the payer and all
+unique payees using SELECT ... ORDER BY id FOR UPDATE, then checks that every firm exists and the payer can cover the
+entire batch.
+It debits the payer once, credits each payee by its summed amount, and inserts one payment row per original entry.
+Duplicate payees therefore retain separate payment records. All changes commit together; any failure before commit rolls
+them back.
+PostgreSQL row locks coordinate concurrent service instances without in-memory mutexes. Acquiring locks in ascending
+firm ID order prevents circular waits between payment transactions following this strategy. Requests touching the same
+firms may wait, then check the latest committed balances before proceeding.
 
 ### Timeouts and retries
 
+Each request has an 8-second budget covering body reading, validation, database work, and retries. Transactions use a
+2-second lock timeout, a 5-second statement timeout, and a 5-second idle transaction timeout. Response writing has an
+additional 2-second allowance.
+
+Deadlocks (`40P01`) and serialization failures (`40001`) retry the entire transaction up to three attempts, with
+exponential backoff and jitter. Lock and statement timeouts are not retried. Exhausted retries or database timeouts
+return `503` with `Retry-After`; a stalled request body returns `408`.
+
+An unknown commit outcome (it means the service sent COMMIT but lost the connection before receiving confirmation.) is
+never automatically retried: the payments may already have committed, and repeating them
+could pay twice.
+
 ### Alternatives considered
 
+### Alternatives considered
+
+- **Optimistic locking:** use version checks and retry conflicting updates. This works well when conflicts are rare, but
+  overlapping payment batches could require repeated work. I chose row locking to serialize access to shared balances.
+- **`SERIALIZABLE` isolation:** provides stronger isolation, but requires handling serialization failures and retrying
+  transactions. For this operation, `READ COMMITTED` with explicit locks on every affected firm provides the required
+  correctness.
+- **Payer-first locking with deadlock retries:** simpler initially, but opposing transfers can acquire locks in
+  conflicting orders. I chose ascending firm ID order to prevent that circular-wait pattern, retaining retries as a
+  safeguard.
+- **In-memory mutexes:** coordinate requests within one process but cannot protect balances across independent service
+  instances. PostgreSQL row locks provide coordination through the shared database.
+- **Queue-based processing:** enqueue whole payment batches and process them
+  sequentially. A single consumer simplifies concurrency but limits throughput
+  and introduces queueing delays. Asynchronous processing would also require
+  an acceptance response and a way to retrieve the final result. Multiple
+  consumers still need database coordination, and redelivery requires
+  idempotency. I chose synchronous database transactions to return `201` or
+  `422` directly and keep the implementation small.
 
 ## Limitations and possible improvements
 
 ### Contention and scalability
 
+## Limitations and possible improvements
+
+### Contention and scalability
+
+Requests involving the same payer or payee compete for row locks and are processed serially where they overlap. A
+frequently used firm can therefore become a bottleneck. Adding application instances increases capacity for independent
+batches, but does not remove contention on shared firms.
+
+The 1,000-payment limit bounds each batch’s lock footprint and work. Timeouts prevent prolonged waits, although requests
+may receive `503` under contention. Each instance also has a bounded connection pool; the combined pools must fit within
+PostgreSQL’s connection capacity.
+
+Possible improvements include measuring lock waits and transaction duration, reducing database round trips, and
+introducing admission control or queueing to absorb bursts. More substantial changes, such as partitioning or a
+ledger-based design, would require revisiting how cross-firm payments remain atomic.
+
+A ledger-based design records each payment as linked debit and credit entries, committed atomically. It provides a clear
+payment history for auditing.
+If receiver balances are calculated from the ledger, payments can append credit entries without updating a shared
+receiver balance row. This can improve receiver-heavy workloads, but it does not automatically make every payment
+faster: preventing payer overspending still requires concurrency controls.
+
 ### Other production improvements
 
+- **Idempotency:** prevent duplicate payments when clients retry after losing a response.
+- **Authentication and authorization:** verify the caller and their permission to spend from the payer.
+- **Observability:** add structured logs, request IDs, and metrics for latency, lock waits, retries, and failures.
+- **Operational reliability:** add readiness checks, database backups, and tested recovery procedures.
+- **Abuse protection:** apply rate limits and bound concurrent requests to protect database capacity.
+- **Reconciliation:** provide a way to inspect recorded payments and investigate unknown commit outcomes.
+
 ### Idempotency
+
 Idempotency is not supported. Every request is treated as a new payment batch, so resubmitting the same request
 may execute it again. If a request times out or the client connection fails,
 the transaction may still commit even though the client receives no response.
@@ -194,15 +270,15 @@ but it cannot prevent client retries.
 A future implementation could accept an Idempotency-Key and store it atomically with the payments and result,
 allowing repeated requests to return the stored result without executing the batch again.
 
-
 ## AI assistance
 
-I used Claude Opus 5.5, OpenAI models (mostly Sol 6.1), and GitHub Copilot to assist with requirements, 
+I used Claude Opus 5.5, OpenAI models (mostly Sol 6.1), and GitHub Copilot to assist with requirements,
 implementation, tests, and code review.
 
 I coordinated several model conversations in parallel. While one model implemented a task,
 I reviewed another part of the solution with a second model and used GitHub Copilot to check earlier changes.
-I shared relevant context and feedback between these conversations and remained responsible for the decisions and final implementation.
+I shared relevant context and feedback between these conversations and remained responsible for the decisions and final
+implementation.
 
 I reviewed the implementation, although my manual review of the test code was limited.
 
