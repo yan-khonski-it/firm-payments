@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,10 +29,7 @@ const sampleRequest = `{
 
 // Temporary: replaced by real request tests once validation and the service exist.
 func TestCreatePaymentsNotImplementedYet(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(sampleRequest))
-	rec := httptest.NewRecorder()
-
-	NewRouter(fakePaymentService{}).ServeHTTP(rec, req)
+	rec := serve(newRequest(http.MethodPost, "/payments", sampleRequest))
 
 	assertErrorResponse(t, rec, http.StatusNotImplemented, codeNotImplemented, "")
 }
@@ -56,14 +55,57 @@ func TestWriteError(t *testing.T) {
 }
 
 func TestPaymentsRejectsOtherMethods(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/payments", nil)
-	rec := httptest.NewRecorder()
+	methods := []string{http.MethodGet, http.MethodPut, http.MethodPatch, http.MethodDelete}
 
-	NewRouter(fakePaymentService{}).ServeHTTP(rec, req)
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			rec := serve(newRequest(method, "/payments", ""))
 
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+			assertErrorResponse(t, rec, http.StatusMethodNotAllowed, codeMethodNotAllowed, "")
+			if allow := rec.Header().Get("Allow"); allow != http.MethodPost {
+				t.Errorf("Allow = %q, want %q", allow, http.MethodPost)
+			}
+		})
 	}
+}
+
+func TestUnknownPathsReturnNotFound(t *testing.T) {
+	tests := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPost, path: "/payments/"},
+		{method: http.MethodPost, path: "/payments/123"},
+		{method: http.MethodPost, path: "/unknown"},
+		{method: http.MethodGet, path: "/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			rec := serve(newRequest(tt.method, tt.path, sampleRequest))
+
+			assertErrorResponse(t, rec, http.StatusNotFound, codeNotFound, "")
+		})
+	}
+}
+
+// newRequest builds a request; a non-empty body is sent as JSON.
+func newRequest(method, target, body string) *http.Request {
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, r)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req
+}
+
+func serve(req *http.Request) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	NewRouter(fakePaymentService{}).ServeHTTP(rec, req)
+	return rec
 }
 
 // assertErrorResponse checks the status and the wire format of an error response:
@@ -74,8 +116,9 @@ func assertErrorResponse(t *testing.T, rec *httptest.ResponseRecorder, wantStatu
 	if rec.Code != wantStatus {
 		t.Errorf("status = %d, want %d", rec.Code, wantStatus)
 	}
-	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
-		t.Errorf("Content-Type = %q, want application/json", ct)
+	contentType := rec.Header().Get("Content-Type")
+	if mediaType, _, err := mime.ParseMediaType(contentType); err != nil || mediaType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", contentType)
 	}
 
 	var body map[string]map[string]any
